@@ -2,183 +2,182 @@
 # -*- coding: utf-8 -*-
 
 import argparse
-import pandas as pd
 import re
-import unicodedata
 from datetime import datetime
-from pathlib import Path
+from typing import Optional, Tuple
 
-# --------- Utilidades ---------
-def strip_accents(s: str) -> str:
-    if s is None:
-        return ""
-    return "".join(c for c in unicodedata.normalize("NFKD", str(s)) if not unicodedata.combining(c))
+import pandas as pd
 
-def norm(s: str) -> str:
-    return strip_accents(str(s)).lower().strip()
+# =============== REGEX: detección y canonización ===============
+# Detecta tipo de vía al **inicio** de "calle" y separa el nombre.
+TIPO_INICIO_RE = re.compile(
+    r"""^\s*
+        (?P<tipo>
+            av(?:\.|enida)?|
+            cal(?:le|\.?)|c\.(?=\s)|
+            bule?var|boulevard|blvd\.?|
+            cto\.?|circuito|
+            cam(?:ino|\.?)|
+            calz(?:ada|\.?)|
+            prol(?:\.|ongaci[oó]n)?|
+            priv(?:ada|\.?)|
+            cerr(?:ada|\.?)|
+            c(?:jon|allej[oó]n)\.?|
+            and(?:ador|\.?)|
+            carretera|carr\.?|cte\.?|
+            eje|
+            paseo|psje\.?|pseo|
+            anillo|
+            v[ií]a|
+            perif(?:[eé]rico|\.?)|
+            viad(?:ucto|\.?)|
+            aldea
+        )
+        \s+  # al menos un espacio entre el tipo y el nombre
+        (?P<nombre>.+)$
+    """,
+    re.IGNORECASE | re.VERBOSE
+)
 
-# --------- Diccionario de tipos de vía ----------
-# Clave = forma canónica que quieres en la salida
-# valores = variantes/abreviaturas aceptadas (sin acentos y en minúsculas para el matching)
-TYPE_MAP = {
-    "Avenida":      ["avenida", "av", "av.", "avda", "avda."],
-    "Calle":        ["calle", "cal", "cal.", "c."],
-    "Bulevar":      ["bulevar", "boulevard", "blvd", "blvd."],
-    "Circuito":     ["circuito", "cto", "cto."],
-    "Camino":       ["camino", "cam", "cam."],
-    "Calzada":      ["calzada", "calz", "calz."],
-    "Prolongación": ["prolongacion", "prol", "prol.", "prolong."],
-    "Privada":      ["privada", "priv", "priv."],
-    "Cerrada":      ["cerrada", "cerr", "cerr."],
-    "Callejón":     ["callejon", "cjon", "cjon.", "cjn", "cjn."],
-    "Andador":      ["andador", "and", "and."],
-    "Carretera":    ["carretera", "carr", "carr.", "cte", "cte."],
-    "Eje":          ["eje"],
-    "Paseo":        ["paseo", "psje", "psje.", "pseo"],
-    "Anillo":       ["anillo"],
-    "Vía":          ["via", "vía"],
-    "Periférico":   ["periferico", "perif."],
-    "Viaducto":     ["viaducto", "viad."],
-    "Aldea":        ["aldea"],
-    "Boulevard":    ["boulevard", "blvd", "blvd."],  # si prefieres unificar a "Bulevar", cambia la clave a "Bulevar"
-}
+# Reglas de canonización (solo regex → forma canónica)
+CANON_RULES = [
+    (re.compile(r'^(?:av(?:\.|enida)?)$', re.IGNORECASE), "Avenida"),
+    (re.compile(r'^(?:cal(?:le|\.?)|c\.)$', re.IGNORECASE), "Calle"),
+    (re.compile(r'^(?:bule?var|boulevard|blvd\.?)$', re.IGNORECASE), "Bulevar"),
+    (re.compile(r'^(?:cto\.?|circuito)$', re.IGNORECASE), "Circuito"),
+    (re.compile(r'^(?:cam(?:ino|\.?))$', re.IGNORECASE), "Camino"),
+    (re.compile(r'^(?:calz(?:ada|\.?))$', re.IGNORECASE), "Calzada"),
+    (re.compile(r'^(?:prol(?:\.|ongaci[oó]n)?)$', re.IGNORECASE), "Prolongación"),
+    (re.compile(r'^(?:priv(?:ada|\.?))$', re.IGNORECASE), "Privada"),
+    (re.compile(r'^(?:cerr(?:ada|\.?))$', re.IGNORECASE), "Cerrada"),
+    (re.compile(r'^(?:c(?:jon|allej[oó]n)\.?)$', re.IGNORECASE), "Callejón"),
+    (re.compile(r'^(?:and(?:ador|\.?))$', re.IGNORECASE), "Andador"),
+    (re.compile(r'^(?:carretera|carr\.?|cte\.?)$', re.IGNORECASE), "Carretera"),
+    (re.compile(r'^(?:eje)$', re.IGNORECASE), "Eje"),
+    (re.compile(r'^(?:paseo|psje\.?|pseo)$', re.IGNORECASE), "Paseo"),
+    (re.compile(r'^(?:anillo)$', re.IGNORECASE), "Anillo"),
+    (re.compile(r'^(?:v[ií]a)$', re.IGNORECASE), "Vía"),
+    (re.compile(r'^(?:perif(?:[eé]rico|\.?))$', re.IGNORECASE), "Periférico"),
+    (re.compile(r'^(?:viad(?:ucto|\.?))$', re.IGNORECASE), "Viaducto"),
+    (re.compile(r'^(?:aldea)$', re.IGNORECASE), "Aldea"),
+]
 
-# Construimos un índice invertido: variante_normalizada -> canónica
-VARIANT_TO_CANON = {}
-for canon, variants in TYPE_MAP.items():
-    for v in variants:
-        VARIANT_TO_CANON[v] = canon
+def canonizar_tipo(tipo: Optional[str]) -> Optional[str]:
+    """Canoniza el tipo_via usando solo regex. Si viene 'Avenida Reforma', extrae 'Avenida'."""
+    if not isinstance(tipo, str) or not tipo.strip():
+        return tipo
+    t = tipo.strip()
 
-# Regex para detectar el tipo de vía al inicio de "calle"
-# Trabajaremos sobre una versión sin acentos y en minúsculas de la cadena, por eso los patrones están sin acentos.
-VARIANTS_PATTERN = "|".join(sorted(map(re.escape, VARIANT_TO_CANON.keys()), key=len, reverse=True))
-# Debe iniciar con la variante, seguida de espacios o punto opcional y luego al menos un carácter más (el nombre)
-CALLE_HEAD_REGEX = re.compile(rf"^\s*(?P<tipo>{VARIANTS_PATTERN})[\.]?\s+(?P<nombre>.+)$", re.IGNORECASE)
-
-def extract_from_calle(calle_val: str):
-    """
-    Si 'calle' inicia con un tipo de vía (incluyendo abreviaturas), devuelve (canon, nombre).
-    Si no, devuelve (None, calle original sin tocar).
-    """
-    if not isinstance(calle_val, str) or not calle_val.strip():
-        return None, calle_val
-    raw = calle_val.strip()
-    # Versión normalizada para hacer match
-    raw_norm = norm(raw)
-    m = CALLE_HEAD_REGEX.match(raw_norm)
-    if not m:
-        return None, raw  # sin cambios
-    tipo_raw = m.group("tipo")
-    nombre_norm_match = m.group("nombre")  # solo para comprobar que existe
-    # Para conservar el resto del nombre con sus acentos originales,
-    # calculamos el offset: volvemos a tokenizar sobre el original.
-    # Heurística simple: dividir por espacios y quitar el primer token del original.
-    parts_orig = raw.split()
-    if len(parts_orig) >= 2:
-        nombre_orig = " ".join(parts_orig[1:]).strip()
-    else:
-        nombre_orig = raw  # fallback
-
-    tipo_canon = VARIANT_TO_CANON.get(tipo_raw.lower(), None)
-    # Si no encontramos canónica por una rareza de normalización, usa capitalización del primer token
-    if not tipo_canon:
-        tipo_canon = parts_orig[0].capitalize()
-
-    return tipo_canon, nombre_orig
-
-def canonicalize_tipo(tipo_val: str):
-    """
-    Normaliza 'tipo_via' a su forma canónica si es una variante; si no, devuelve el original tal cual.
-    """
-    if not isinstance(tipo_val, str) or not tipo_val.strip():
-        return tipo_val
-    n = norm(tipo_val)
-    # Si 'tipo_via' trae además el nombre (p. ej. 'Avenida Reforma'), intentamos separar
-    m = CALLE_HEAD_REGEX.match(n)
+    # Si trae también el nombre en el mismo campo, intenta separar con la misma regex
+    m = TIPO_INICIO_RE.match(t)
     if m:
-        canon = VARIANT_TO_CANON.get(m.group("tipo").lower(), None)
-        return canon if canon else tipo_val.strip()
+        t = m.group("tipo")
 
-    # Coincidencia exacta con alguna variante
-    for variant, canon in VARIANT_TO_CANON.items():
-        if n == variant:
+    for rx, canon in CANON_RULES:
+        if rx.match(t):
             return canon
-    # Como mejora, si coincide con la clave canónica sin acentos:
-    for canon in TYPE_MAP.keys():
-        if n == norm(canon):
-            return canon
-    return tipo_val.strip()
+    return t  # sin cambio conocido
 
-def clean_row(tipo_via, calle):
+def limpiar_par(tipo_via: Optional[str], calle: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
     """
-    Lógica de limpieza:
-    1) Si 'calle' comienza con tipo de vía, se impone ese tipo y se extrae el nombre.
-    2) Si no, solo se canoniza 'tipo_via' si es posible.
-    3) Se maneja el caso ejemplo: tipo_via='Calle' y calle='Avenida Reforma' -> usar 'Avenida' y 'Reforma'.
+    - Si 'calle' inicia con un tipo de vía reconocido → separa tipo y nombre, y canoniza tipo.
+    - Si no, solo canoniza 'tipo_via'.
+    - Si 'tipo_via' y 'calle' son iguales, reintenta separar desde 'calle'.
     """
-    # Intentar extraer desde 'calle'
-    tipo_from_calle, nombre_from_calle = extract_from_calle(calle)
+    # 1) Intentar extraer desde el inicio de "calle"
+    if isinstance(calle, str) and calle.strip():
+        m = TIPO_INICIO_RE.match(calle.strip())
+        if m:
+            tipo_raw = m.group("tipo")
+            nombre = m.group("nombre").strip()
+            tipo_canon = canonizar_tipo(tipo_raw)
+            return tipo_canon, nombre
 
-    if tipo_from_calle:
-        # Priorizar el tipo detectado en 'calle'
-        return tipo_from_calle, nombre_from_calle.strip() if isinstance(nombre_from_calle, str) else nombre_from_calle
+    # 2) Canonizar tipo_via
+    tipo_canon = canonizar_tipo(tipo_via)
 
-    # Si no detectamos tipo en 'calle', normalizamos tipo_via si es posible
-    tipo_norm = canonicalize_tipo(tipo_via)
+    # 3) Caso sucio: tipo_via == calle → reintentar
+    if isinstance(tipo_via, str) and isinstance(calle, str):
+        if tipo_via.strip().lower() == calle.strip().lower():
+            m2 = TIPO_INICIO_RE.match(calle.strip())
+            if m2:
+                return canonizar_tipo(m2.group("tipo")), m2.group("nombre").strip()
 
-    # Si tipo_via viene igual que 'calle' (casos sucios) y 'calle' parece tener tipo y nombre juntos, volver a intentar
-    if isinstance(tipo_via, str) and isinstance(calle, str) and norm(tipo_via) == norm(calle):
-        t2, n2 = extract_from_calle(calle)
-        if t2:
-            return t2, n2.strip()
+    # 4) Sin cambios estructurales
+    return tipo_canon, (calle.strip() if isinstance(calle, str) else calle)
 
-    # Sin cambios estructurales, devolver lo mejor posible
-    return tipo_norm, calle.strip() if isinstance(calle, str) else calle
-
-# --------- Proceso principal ----------
-def process_file(input_path: str, output_path: str, sep: str = ",", encoding: str = "utf-8", preview: int = 0):
-    # Cargar CSV con tolerancia de encoding
+# ================= CSV workflow =================
+def process_csv(input_path: str, output_path: Optional[str], sep: str, encoding: str,
+                preview: int, export: str):
+    """
+    export: 'all' (todas las filas, con cambios aplicados) o 'changed' (solo filas modificadas).
+    """
+    # Cargar con tolerancia
     try:
         df = pd.read_csv(input_path, sep=sep, encoding=encoding, dtype=str, keep_default_na=False)
     except UnicodeDecodeError:
-        # Intento alterno común en datos MX
         df = pd.read_csv(input_path, sep=sep, encoding="latin-1", dtype=str, keep_default_na=False)
 
-    # Validación de columnas
-    cols = set(df.columns.str.strip())
-    if "tipo_via" not in cols or "calle" not in cols:
-        raise ValueError(f"El archivo debe contener las columnas 'tipo_via' y 'calle'. Columnas detectadas: {sorted(cols)}")
+    cols = [c.strip() for c in df.columns]
+    df.columns = cols
+    if "tipo_via" not in df.columns or "calle" not in df.columns:
+        raise ValueError(f"El CSV debe contener las columnas 'tipo_via' y 'calle'. Columnas: {df.columns.tolist()}")
 
-    # Aplicar limpieza fila por fila (vectorizado con apply para claridad)
-    def _row_apply(row):
-        t, c = clean_row(row["tipo_via"], row["calle"])
+    # Copias para detectar cambios
+    orig_tipo = df["tipo_via"].copy()
+    orig_calle = df["calle"].copy()
+
+    # Aplicar limpieza (fila a fila por claridad; sigue siendo rápido)
+    def _apply(row):
+        t, c = limpiar_par(row["tipo_via"], row["calle"])
         return pd.Series({"tipo_via": t, "calle": c})
 
-    cleaned = df.apply(_row_apply, axis=1)
+    cleaned = df.apply(_apply, axis=1)
     df["tipo_via"] = cleaned["tipo_via"]
-    df["calle"]   = cleaned["calle"]
+    df["calle"] = cleaned["calle"]
 
-    # Vista previa opcional
+    changed_mask = (df["tipo_via"] != orig_tipo) | (df["calle"] != orig_calle)
+
+    # Preview
     if preview and preview > 0:
-        print(df[["tipo_via", "calle"]].head(preview).to_string(index=False))
+        sample = df.loc[changed_mask, ["tipo_via", "calle"]].head(preview)
+        print("PREVIEW de filas modificadas:")
+        if sample.empty:
+            print("(No hay cambios)")
+        else:
+            print(sample.to_string(index=False))
 
-    # Guardar salida
-    out = Path(output_path) if output_path else Path(input_path).with_name(
-        Path(input_path).stem + f"_limpio_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    )
-    df.to_csv(out, index=False, encoding="utf-8")
-    print(f"Archivo guardado en: {out.resolve()}")
+    # Export
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out = output_path or f"{input_path.rsplit('.',1)[0]}_limpio_{ts}.csv"
+
+    if export == "changed":
+        df_out = df.loc[changed_mask].copy()
+    else:
+        df_out = df
+
+    # Guardar siempre con comillas para seguridad
+    df_out.to_csv(out, index=False, encoding="utf-8", sep=sep, quoting=1)  # 1 = csv.QUOTE_ALL
+    print(f"CSV guardado en: {out}")
 
 def main():
-    p = argparse.ArgumentParser(description="Limpia y normaliza columnas 'tipo_via' y 'calle' en un CSV.")
-    p.add_argument("--input", required=True, help="Ruta al CSV de entrada")
-    p.add_argument("--output", default=None, help="Ruta al CSV de salida (opcional). Si no se da, se genera *_limpio_YYYYMMDD_HHMMSS.csv")
-    p.add_argument("--sep", default=",", help="Separador del CSV (por defecto ',')")
-    p.add_argument("--encoding", default="utf-8", help="Encoding de lectura (por defecto 'utf-8')")
-    p.add_argument("--preview", type=int, default=0, help="Muestra las primeras N filas procesadas")
-    args = p.parse_args()
+    ap = argparse.ArgumentParser(description="Limpia 'tipo_via' y 'calle' en un CSV usando puras regex.")
+    ap.add_argument("--input", required=True, help="Ruta del CSV de entrada")
+    ap.add_argument("--output", default=None, help="Ruta del CSV de salida (por defecto se autogenera con timestamp)")
+    ap.add_argument("--sep", default=",", help="Separador del CSV (por defecto ',')")
+    ap.add_argument("--encoding", default="utf-8", help="Encoding de lectura (por defecto 'utf-8')")
+    ap.add_argument("--preview", type=int, default=10, help="Muestra N filas modificadas")
+    ap.add_argument("--export", choices=["all", "changed"], default="all", help="Qué exportar al CSV")
+    args = ap.parse_args()
 
-    process_file(args.input, args.output, sep=args.sep, encoding=args.encoding, preview=args.preview)
+    process_csv(
+        input_path=args.input,
+        output_path=args.output,
+        sep=args.sep,
+        encoding=args.encoding,
+        preview=args.preview,
+        export=args.export
+    )
 
 if __name__ == "__main__":
     main()
